@@ -1,2 +1,2 @@
 # SARS-CoV-2_vac_scRNAseq
-Code to reproduce analysis from [reference 2023].
+The code to reproduce analysis from Li and Obraztsova et al (2023) will deposited here soon!
