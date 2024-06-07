@@ -1,0 +1,19 @@
+STANDARD_NAME	KEGG_B_CELL_RECEPTOR_SIGNALING_PATHWAY
+SYSTEMATIC_NAME	M5436
+COLLECTION	C2:CP:KEGG
+MSIGDB_URL	https://www.gsea-msigdb.org/gsea/msigdb/human/geneset/KEGG_B_CELL_RECEPTOR_SIGNALING_PATHWAY
+NAMESPACE	Human_NCBI_Gene_ID
+DESCRIPTION_BRIEF	B cell receptor signaling pathway
+DESCRIPTION_FULL	B cells are an important component of adaptive immunity. They produce and secrete millions of different antibody molecules, each of which recognizes a different (foreign) antigen. The B cell receptor (BCR) is an integral membrane protein complex that is composed of two immunoglobulin (Ig) heavy chains, two Ig light chains and two heterodimers of Ig-alpha and Ig-beta. After BCR ligation by antigen, three main protein tyrosine kinases (PTKs) -the SRC-family kinase LYN, SYK and the TEC-family kinase BTK- are activated. Phosphatidylinositol 3-kinase (PI3K) and phospholipase C-gamma 2 (PLC-gamma 2) are important downstream effectors of BCR signalling. This signalling ultimately results in the expression of immediate early genes that further activate the expression of other genes involved in B cell proliferation, differentiation and Ig production as well as other processes.
+PMID	
+GEOID	
+AUTHORS	
+CONTRIBUTOR	KEGG
+CONTRIBUTOR_ORG	Kyoto Encyclopedia of Genes and Genomes
+EXACT_SOURCE	hsa04662
+FILTERED_BY_SIMILARITY	
+EXTERNAL_NAMES_FOR_SIMILAR_TERMS	
+EXTERNAL_DETAILS_URL	http://www.genome.jp/kegg/pathway/hsa/hsa04662.html
+SOURCE_MEMBERS	10000,10451,10725,10892,11025,11261,1147,118788,1380,207,208,2213,2353,23533,25780,27071,2885,2932,29760,3265,3551,3635,3725,3845,4067,4772,4773,4775,4776,4790,4792,4793,4794,4893,5290,5291,5293,5294,5295,5296,5336,5530,5532,5533,5534,5535,5579,5594,5595,5604,5605,5777,5879,5880,5881,5894,5970,63928,6654,6655,6850,695,7409,7410,84433,8503,8517,8519,8915,930,933,971,973,974,975
+GENE_SYMBOLS	AKT3,VAV3,NFAT5,MALT1,LILRB3,CHP1,CHUK,PIK3AP1,CR2,AKT1,AKT2,FCGR2B,FOS,PIK3R5,RASGRP3,DAPP1,GRB2,GSK3B,BLNK,HRAS,IKBKB,INPP5D,JUN,KRAS,LYN,NFATC1,NFATC2,NFATC3,NFATC4,NFKB1,NFKBIA,NFKBIB,NFKBIE,NRAS,PIK3CA,PIK3CB,PIK3CD,PIK3CG,PIK3R1,PIK3R2,PLCG2,PPP3CA,PPP3CB,PPP3CC,PPP3R1,PPP3R2,PRKCB,MAPK1,MAPK3,MAP2K1,MAP2K2,PTPN6,RAC1,RAC2,RAC3,RAF1,RELA,CHP2,SOS1,SOS2,SYK,BTK,VAV1,VAV2,CARD11,PIK3R3,IKBKG,IFITM1,BCL10,CD19,CD22,CD72,CD79A,CD79B,CD81
+FOUNDER_NAMES	

@@ -1,0 +1,17 @@
+isotype_short,timepoint,shm
+IGHG,pre-I,0
+IGHG,I+1w,5
+IGHG,I+2w,8
+IGHG,I+3w,14
+IGHG,pre-II,20
+IGHG,II+1w,20
+IGHG,II+2w,25
+IGHG,II+3w,27
+IGHM,pre-I,0
+IGHM,I+1w,6
+IGHM,I+2w,6
+IGHM,I+3w,6
+IGHM,pre-II,6
+IGHM,II+1w,6
+IGHM,II+2w,6
+IGHM,II+3w,6

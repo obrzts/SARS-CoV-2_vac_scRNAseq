@@ -1,0 +1,971 @@
+---
+title: "Single B cell data from SARS-CoV-2 vaccination study"
+author: "Anna Obraztsova"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(DropletUtils)
+library(BiocParallel)
+library(scuttle)
+
+library(DelayedArray)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(data.table)
+
+library(ggplot2)
+library(ggthemes)
+library(ggbeeswarm)
+library(patchwork)
+library(latex2exp)
+
+tables_path = "data/"
+
+theme_basic <- function(){
+  # Plotting theme for ggplots
+  theme_classic() + 
+    theme(strip.background = element_blank(),
+          strip.text = element_text(size = 10),
+          axis.text = element_text(size = 10, color = "black"),
+          panel.grid.minor = element_blank(),
+          plot.title = element_text(size = 11, hjust = 0.5))
+}
+```
+
+## Demultiplex samples
+
+Load sample 8
+
+```{r}
+# take gene expression counts from run_3 (NextSeq data only)
+path = "../../exp_1/run_3/data/sample_feature_bc_matrix.h5"
+path = "~/storage_gpcf_s24660/covid/cellranger_multi_output/exp_1/run_3/outs/per_sample_outs/run_3/count/sample_feature_bc_matrix.h5" # on the server
+sce_run_3 <- read10xCounts(path,  col.names=T)
+
+# use human readable feature IDs
+rownames(sce_run_3) <- uniquifyFeatureNames(names = rowData(sce_run_3)$Symbol, ID = rowData(sce_run_3)$ID)
+
+hto_names = rownames(sce_run_3)[str_detect(rownames(sce_run_3), "Hashtag")]
+ag_names = c("RBD_APC_TotalSeqC", "Spike_PE_TotalSeqC")
+genes = rownames(sce_run_3)[!rownames(sce_run_3) %in% c(hto_names, ag_names)]
+gex_sce <- sce_run_3[genes, ]
+
+# take barcode and VDJ libraries from run_2 (NextSeq + NovaSeq)
+path = "../../exp_1/run_2/data/sample_feature_bc_matrix.h5"
+path = "~/storage_gpcf_s24660/covid/cellranger_multi_output/exp_1/run_2/outs/per_sample_outs/run_2/count/sample_feature_bc_matrix.h5" # on the server
+sce_run_2 <- read10xCounts(path, col.names=T)
+hto_names = rownames(sce_run_2)[str_detect(rownames(sce_run_2), "Hashtag")]
+ag_names = c("RBD", "Spike")
+hto_sce <- sce_run_2[hto_names, ]
+rownames(hto_sce) <- paste0("H", str_match(rownames(hto_sce), "\\d+"))
+
+ag_sce <- sce_run_2[ag_names, ]
+
+sample_8 =  list(gex = gex_sce, hto = hto_sce, ag = ag_sce)
+```
+
+Load samples from experiment 2
+
+```{r}
+upload_data <- function(path){
+  sce <- read10xCounts(paste0(path, "sample_feature_bc_matrix.h5"), col.names=T)
+  
+  # use human readable feature IDs
+  rownames(sce) <- uniquifyFeatureNames(names = rowData(sce)$Symbol, ID = rowData(sce)$ID)
+  
+  # separate HTO, antigen and GEX matrices
+  hto_names = rownames(sce)[str_detect(rownames(sce), "Hashtag")]
+  ag_names = c("RBD_APC_TotalSeqC", "Spike_PE_TotalSeqC")
+  genes = rownames(sce)[!rownames(sce) %in% c(hto_names, ag_names)]
+  
+  hto_sce <- sce[hto_names, ]
+  rownames(hto_sce) <- paste0("H", str_match(rownames(hto_sce), "\\d+"))
+  
+  ag_sce <- sce[ag_names, ]
+  rownames(ag_sce) <- c("RBD", "Spike")
+  
+  gex_sce <- sce[genes, ]
+  
+  # calculate background profile - not used
+  # empty_sce = read10xCounts(paste0(path, "raw_feature_bc_matrix.h5"), col.names=T)
+  # empty_sce = empty_sce[, !(colnames(empty_sce) %in% colnames(sce))]
+  # rownames(empty_sce) <- uniquifyFeatureNames(names = rowData(empty_sce)$Symbol, ID = rowData(empty_sce)$ID)
+  # hto_empty_sce <- empty_sce[hto_names, ]
+  # p = proportions(rowSums(counts(hto_empty_sce)))
+  
+  list(gex = gex_sce, hto = hto_sce, ag = ag_sce)
+}
+
+sample_path = c(paste0("../exp_2/10x_", 1:7, "/data/"))
+sample_path = c(paste0("~/storage_gpcf_s24660/covid/cellranger_multi_output/exp_2/10x_", 1:7,
+                       "/outs/per_sample_outs/10x_", 1:7, "/count/")) # on the server
+sce_list = lapply(sample_path, upload_data)
+
+sce_list[[8]] = sample_8
+```
+
+Keep only valid hashtags
+
+```{r}
+# prepare list of valid hashtags per sample
+metadata <- fread("tables/sample_metadata.csv") %>%
+  mutate(hashtag = str_replace(hashtag, "ashtag ", ""))
+valid_hashtags <- metadata %>%
+  select(sample, hashtag) %>%
+  unique
+valid_hashtags <- lapply(split(valid_hashtags, valid_hashtags$sample), 
+                         function(x) x$hashtag)
+
+# remove invalid hashtags
+filter_hashtag <- function(sample){
+  sample_list <- sce_list[[sample]]
+  hto_mat <- sample_list$hto
+  hto_mat <- hto_mat[valid_hashtags[[sample]], ]
+  sample_list$hto <- hto_mat
+  
+  sample_list
+}
+
+samples = 1:8
+sce_list = lapply(samples, filter_hashtag)
+```
+
+Demultiplex samples
+
+```{r}
+demultiplex <- function(sample_list, doublet.min = 3, confident.min = 2,
+                        doublet.mixture = F){
+  hto_mat <- counts(sample_list[["hto"]])
+  hash_stats <- hashedDrops(hto_mat,
+                            #ambient = sample_list[["emp_profile"]],
+                            doublet.min = doublet.min,
+                            confident.min = confident.min,
+                            doublet.mixture = doublet.mixture)
+  
+  sample_list[["hash_stats"]] = hash_stats
+  sample_list
+}
+
+sce_list = lapply(sce_list, demultiplex)
+```
+
+Check thresholds
+
+```{r, fig.width = 4, fig.height=2.5}
+demu_res_def <- lapply(samples, function(x) sce_list[[x]][["hash_stats"]] %>%
+                         as.data.frame %>%
+                         mutate(sample = x,
+                                barcode = rownames(sce_list[[x]][["hash_stats"]]))) %>%
+  rbindlist %>%
+  mutate(class = ifelse(Confident, "Singlet", ifelse(Doublet, "Doublet", "Negative")),
+         sample = factor(sample, levels = as.character(samples)))
+```
+
+```{r, fig.width = 7, fig.height=5}
+p <- demu_res_def %>% 
+  ggplot(aes(x = LogFC, y = LogFC2, color = class)) + 
+  geom_point(shape = 21, size = 0.2, alpha = 0.5) + 
+  facet_wrap(~sample, scales = "free") +
+  theme_basic() + 
+  labs(x = "Log fold-change of best HTO over second best",
+       y = "Log fold-change of second HTO over ambient background") +
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0,10,2)) +
+  scale_x_continuous(limits = c(0, 10), breaks = seq(0,10,2)) +
+  scale_color_tableau()
+
+pdf(paste0(figures_path, "00_HTO_logFC_default.pdf"), width=13, height=13)
+p
+dev.off()
+```
+
+Now run with adjusted parameters
+
+```{r}
+demux_params = fread("tables/demultiplexing_parameters.csv")
+d.min <- demux_params$doublet.min
+names(d.min) <- as.character(demux_params$sample)
+c.min <- demux_params$confident.min
+names(c.min) <- as.character(demux_params$sample)
+
+sce_list = lapply(samples, function(i) demultiplex(sce_list[[i]],
+                                                   confident.min = c.min[[i]],
+                                                   doublet.min = d.min[[i]],
+                                                   doublet.mixture = F))
+names(sce_list) <- samples
+```
+
+```{r, fig.width = 4, fig.height=2.5}
+# make hashtag to hashtage_num table; hashedDrops returns only the numbers
+hash_name <- lapply(samples, function(x) data.table(hashtag = rownames(sce_list[[x]]$hto)) %>%
+                      mutate(hashtag_num = 1:n(),
+                             sample = x)) %>%
+  rbindlist()
+
+demu_res <- lapply(samples, function(x) sce_list[[x]][["hash_stats"]] %>%
+                     as.data.frame %>%
+                     mutate(sample = x,
+                            barcode = rownames(sce_list[[x]][["hash_stats"]]))) %>%
+  rbindlist %>%
+  mutate(class = ifelse(Confident, "Singlet", ifelse(Doublet, "Doublet", "Negative"))) %>%
+  merge(hash_name %>% select(Best = hashtag_num,
+                             Best_name = hashtag,
+                             sample),
+        by = c("sample", "Best")) %>%
+  merge(hash_name %>% select(Second = hashtag_num,
+                             Second_name = hashtag,
+                             sample),
+        by = c("sample", "Second"))
+
+p <- demu_res %>% 
+  ggplot(aes(x = LogFC, y = LogFC2, color = class)) + 
+  geom_point(shape = 21, size = 0.2, alpha = 0.5) + 
+  facet_wrap(~sample, scales = "free") +
+  theme_basic() + 
+  labs(x = "Log fold-change of best HTO over second best",
+       y = "Log fold-change of second HTO over ambient background") +
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0,10,2)) +
+  scale_x_continuous(limits = c(0, 10), breaks = seq(0,10,2)) +
+  scale_color_tableau()
+
+pdf(paste0(figures_path, "00_HTO_logFC.pdf"), width = 13, height=13)
+p
+dev.off()
+```
+
+Generate plots with cluster assignment
+
+```{r, fig.width = 10, fig.height = 10}
+make_hashtag_plot <- function(sample_list, name){
+  best_hashtags_num = sample_list[["hash_stats"]]$Best[sample_list[["hash_stats"]]$Confident] %>%
+    unique
+  best_hashtags = rownames(sample_list[["hto"]])[best_hashtags_num]
+  
+  hto_df <- counts(sample_list[["hto"]]) %>%
+    t %>%
+    as.data.frame %>%
+    select(all_of(best_hashtags)) %>%
+    mutate(barcode = colnames(sample_list[["hto"]]))
+  colnames(hto_df) <- colnames(hto_df) %>%
+    str_replace("_TotalSeqC", "") %>%
+    str_replace("ashtag_", "")
+  hto_df <- hto_df %>%
+    pivot_longer(!c(barcode), names_to = "hashtag", values_to = "count") %>%
+    mutate(log_count = log10(count + 1)) %>%
+    pivot_wider(id_cols = c(barcode),
+                names_from = hashtag, values_from = log_count)
+  
+  color_list = c(ggthemes_data[["tableau"]][["color-palettes"]][["regular"]]$`Tableau 10`$value,
+                 ggthemes_data[["tableau"]][["color-palettes"]][["regular"]]$`Tableau 20`$value[seq(2, 20, 2)])
+  color_code = data.frame(cluster = c(as.character(best_hashtags_num), "Doublet", "None"),
+                          color = c(color_list[1:length(best_hashtags_num)], "black", "grey50"))
+  
+  colors <- sample_list[["hash_stats"]] %>% 
+    as.data.frame %>%
+    mutate(cluster = ifelse(Confident, Best,
+                            ifelse(Doublet, "Doublet", "None")),
+           order = 1:n()) %>%
+    merge(color_code) %>%
+    arrange(order)
+  
+  pdf(paste0(figures_path, "01_barcode_correlation_sample_", name, ".pdf"), 
+      width = length(best_hashtags) * 2,
+      height = length(best_hashtags) * 2)
+  plot(hto_df %>% select(contains("H")), cex=0.5, col = colors$color)
+  dev.off()
+}
+
+x <- lapply(1:length(sce_list), function(x) make_hashtag_plot(sce_list[[x]], x))
+```
+
+```{r, fig.width = 7, fig.height=5}
+res_summary <- demu_res %>%
+  mutate(class = as.factor(class)) %>%
+  count(sample, class, name = "count", .drop = F) %>%
+  add_count(sample, wt = count, name = "tot")
+
+p <- res_summary %>%
+  filter(class != "Singlet") %>%
+  ggplot(aes(x = sample, y = 100 * count/tot, fill = class)) +
+  geom_col(position = "dodge") +
+  labs(x = "Sample", y = "%") +
+  theme_basic() +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_brewer(palette = "Set1", name = "")
+
+pdf(paste0(figures_path, "01_demultiplexing_stats.pdf"), width = 5, height=2.5)
+p
+dev.off()
+```
+
+Save demultiplexing results
+
+```{r}
+saveRDS(demu_res, paste0(tables_path, "demultiplexing_results.Rds"))
+```
+
+## Filter features
+
+Merge Ig genes in one feature
+
+```{r}
+collapse_Ig_features <- function(sample_list){
+  sce = sample_list[["gex"]]
+  
+  # sum Ig read counts
+  bad_V_gene_name = c("AC233755.1", "AC233755.2") # another names for IGHV4-38-2 and IGHV3-9
+  ighv_features <- c(rownames(sce)[str_detect(rownames(sce), "IGH[VJ]")], 
+                     rownames(sce)[str_detect(rownames(sce), "IGH[D]\\d.*")],
+                     bad_V_gene_name)
+  ighv_counts <- counts(sce[ighv_features,])
+  ighv_count <- colSums(ighv_counts)
+  
+  igklv_features <- rownames(sce)[str_detect(rownames(sce), "IG[KL][VJ]")]
+  igklv_counts <- counts(sce[igklv_features,])
+  igklv_count <- colSums(igklv_counts)
+  
+  ighc_features <- rownames(sce)[str_detect(rownames(sce), "IGH[AGEDM]")]
+  ighc_features <- ighc_features[ighc_features != "IGHMBP2"] # Immunoglobulin Mu DNA Binding Protein 2
+  ighc_counts <- counts(sce[ighc_features,])
+  ighc_count <- colSums(ighc_counts)
+  
+  igklc_features <- rownames(sce)[str_detect(rownames(sce), "IG[KL]C")]
+  igklc_counts <- counts(sce[igklc_features,])
+  igklc_count <- colSums(igklc_counts)
+  
+  # sum ribosomal gene counts
+  rib_features <- rownames(sce)[grepl('^RP[SL]', rownames(sce))]
+  rib_counts <- counts(sce[rib_features,])
+  rib_count <- colSums(rib_counts)
+  
+  # sum HLA counts fro HLA-DQA, HLA-DQB, HLA-DRB
+  HLA_DQA_features <- rownames(sce)[str_detect(rownames(sce), "HLA-DQA")]
+  HLA_DQA_counts <- counts(sce[HLA_DQA_features,])
+  HLA_DQA_count <- colSums(HLA_DQA_counts)
+  
+  HLA_DQB_features <- rownames(sce)[str_detect(rownames(sce), "HLA-DQB")]
+  HLA_DQB_counts <- counts(sce[HLA_DQB_features,])
+  HLA_DQB_count <- colSums(HLA_DQB_counts)
+  
+  HLA_DRB_features <- rownames(sce)[str_detect(rownames(sce), "HLA-DRB")]
+  HLA_DRB_counts <- counts(sce[HLA_DRB_features,])
+  HLA_DRB_count <- colSums(HLA_DRB_counts)
+  
+  # remove from the count matrix
+  normal_features <- rownames(sce)[!(rownames(sce) %in% c(ighv_features, igklv_features, ighc_features, igklc_features, 
+                                                          rib_features,
+                                                          HLA_DQA_features, HLA_DQB_features, HLA_DRB_features))]
+  sce <- sce[normal_features, ]
+  
+  # add as a single feature for heavy and for light chain
+  new_mat <- counts(sce) %>%
+    rbind(DelayedArray(t(as.array(ighv_count)))) %>%
+    rbind(DelayedArray(t(as.array((igklv_count))))) %>%
+    rbind(DelayedArray(t(as.array((ighc_count))))) %>%
+    rbind(DelayedArray(t(as.array((igklc_count))))) %>%
+    rbind(DelayedArray(t(as.array((rib_count))))) %>%
+    rbind(DelayedArray(t(as.array((HLA_DQA_count))))) %>%
+    rbind(DelayedArray(t(as.array((HLA_DQB_count))))) %>%
+    rbind(DelayedArray(t(as.array((HLA_DRB_count)))))
+  rownames(new_mat) <- c(rownames(sce), "IGHV", "IGK/LV", "IGHC", "IGK/LC", "Ribosomal", "HLA-DQA", "HLA-DQB", "HLA-DRB")
+  
+  new_gex <- SingleCellExperiment(list(counts=new_mat))
+  
+  sample_list[["gex"]] = new_gex
+  sample_list
+}
+
+sce_list = lapply(sce_list, collapse_Ig_features)
+```
+
+## Filter cells
+
+Define outlier thresholds for RNA count, number of genes detected, fraction of mitochondrial RNA and heme expression.
+
+```{r}
+do_QC <- function(sample_list){
+  sce = sample_list[["gex"]]
+  
+  # calculate metrics
+  mitocondrial = rownames(sce)[grep('^MT-', rownames(sce))]
+  hemoglobin <- grepl("^HB[^(P)]", rownames(sce))
+  stats = perCellQCMetrics(sce, subsets = list(Mt = mitocondrial, Hb = hemoglobin))
+  sce$mt_percent <- stats$subsets_Mt_percent
+  sce$hb_percent <- stats$subsets_Hb_percent
+  sce$RNA_count <- stats$sum
+  sce$genes_detected <- stats$detected
+  
+  discard_libsize = isOutlier(stats$sum, type = 'lower', log = T)
+  discard_features = isOutlier(stats$detected, type = 'lower', log = T)
+  discard_mito = isOutlier(stats$subsets_Mt_percent, type = 'higher', log = F)
+  discard_hb = stats$subsets_Hb_percent > 1
+  
+  stats_df <- stats %>%
+    as.data.frame %>%
+    select(mt_percent = subsets_Mt_percent,
+           hb_percent = subsets_Hb_percent,
+           RNA_count = sum, 
+           genes_detected = detected)
+  stats_df$discard_libsize = as.logical(discard_libsize)
+  stats_df$discard_features = as.logical(discard_features)
+  stats_df$discard_mito = as.logical(discard_mito)
+  stats_df$discard_hb = discard_hb
+  
+  sample_list[["stats_df"]] = stats_df
+  sample_list
+}
+
+sce_list = lapply(sce_list, do_QC)
+```
+
+```{r, fig.width=8, fig.height=8}
+stats_df <- lapply(1:length(sce_list), function(x) sce_list[[x]][["stats_df"]] %>%
+                     mutate(sample = x,
+                            barcode = colnames(sce_list[[x]]$gex))) %>%
+  rbindlist %>%
+  merge(demu_res, by = c("sample", "barcode"))
+
+p1 <- stats_df %>%
+  ggplot(aes(x = sample, y = RNA_count, color = discard_libsize, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  labs(x = "", y = TeX("UMIs"), title = "RNA count") +
+  theme_basic() +
+  scale_x_continuous(breaks = 1:length(sce_list)) +
+  scale_y_log10(breaks = 10^c(3, 4, 5),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_manual(values = c("black", "firebrick")) +
+  guides(color = "none")
+
+p2 <- stats_df %>%
+  ggplot(aes(x = sample, y = genes_detected, color = discard_features, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  labs(x = "", y = TeX("Genes"), title = "Gene count") +
+  theme_basic() +
+  scale_x_continuous(breaks = 1:length(sce_list)) +
+  scale_y_log10(breaks = 10^c(1, 2, 3, 4),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_manual(values = c("black", "firebrick")) +
+  guides(color = "none")
+
+p3 <- stats_df %>%
+  ggplot(aes(x = sample, y = mt_percent, color = discard_mito, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  labs(x = "Sample", y = "%", title = "Mt genes") +
+  theme_basic() +
+  scale_x_continuous(breaks = 1:length(sce_list)) +
+  scale_color_manual(values = c("black", "firebrick")) +
+  guides(color = "none")
+
+p4 <- stats_df %>%
+  ggplot(aes(x = sample, y = hb_percent, color = discard_hb, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  labs(x = "Sample", y = "%", title = "Hb genes") +
+  theme_basic() +
+  scale_x_continuous(breaks = 1:length(sce_list)) +
+  scale_color_manual(values = c("black", "firebrick")) +
+  guides(color = "none")
+
+pdf(paste0(figures_path, "02_QC_metrics.pdf"), width = 8, height = 7)
+(p1 + p2) / (p3 + p4)
+dev.off()
+```
+
+
+```{r, fig.width=10, fig.height=4}
+p1 <- stats_df %>%
+  mutate(class = factor(class, levels = c("Negative", "Singlet", "Doublet"))) %>%
+  ggplot(aes(x = class, y = RNA_count, color = discard_libsize, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  stat_summary(geom = "crossbar", fun = mean, color = "steelblue") +
+  facet_grid(~sample) +
+  labs(x = "", y = TeX("UMIs"), title = "RNA count") +
+  theme_basic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom") +
+  scale_y_log10(breaks = 10^c(3, 4, 5),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_manual(values = c("black", "firebrick"), name = "High Mt gene expression")
+
+p2 <- stats_df %>%
+  mutate(class = factor(class, levels = c("Negative", "Singlet", "Doublet"))) %>%
+  ggplot(aes(x = class, y = genes_detected, color = discard_features, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  stat_summary(geom = "crossbar", fun = mean, color = "steelblue") +
+  facet_grid(~sample) +
+  labs(x = "", y = TeX("Genes"), title = "Gene count") +
+  theme_basic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom") +
+  scale_y_log10(breaks = 10^c(3, 4, 5),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_manual(values = c("black", "firebrick"), name = "High Mt gene expression")
+
+p3 <- stats_df %>%
+  mutate(class = factor(class, levels = c("Negative", "Singlet", "Doublet"))) %>%
+  ggplot(aes(x = class, y = mt_percent, color = discard_mito, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  stat_summary(geom = "crossbar", fun = mean, color = "steelblue") +
+  facet_grid(~sample) +
+  labs(x = "Sample", y = "%", title = "Mt genes") +
+  theme_basic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom") +
+  scale_color_manual(values = c("black", "firebrick"), name = "High Mt gene expression")
+
+p4 <- stats_df %>%
+  mutate(class = factor(class, levels = c("Negative", "Singlet", "Doublet"))) %>%
+  ggplot(aes(x = class, y = hb_percent, color = discard_hb, group = sample)) +
+  geom_quasirandom(shape = 21) +
+  stat_summary(geom = "crossbar", fun = mean, color = "steelblue") +
+  facet_grid(~sample) +
+  labs(x = "Sample", y = "%", title = "Hb genes") +
+  theme_basic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom") +
+  scale_color_manual(values = c("black", "firebrick"), name = "High Mt gene expression")
+
+pdf(paste0(figures_path, "02_QC_metrics_per_hashtag_class.pdf"), width = 10, height = 16)
+p1 / p2 / p3 / p4
+dev.off()
+```
+
+```{r}
+df <- sce_list[[8]]$hto %>%
+  counts %>%
+  t %>%
+  as.data.frame() %>%
+  mutate(barcode = colnames(sce_list[[8]]$hto)) %>%
+  merge(stats_df %>%
+          filter(sample == 8))
+
+df %>%
+  filter(class == "Singlet") %>%
+  select(barcode, Best, all_of(paste0("H", 1:6))) %>%
+  pivot_longer(!c(barcode, Best), names_to = "hashtag", values_to = "count") %>%
+  mutate(hashtag = str_match(hashtag, "\\d")[, 1]) %>%
+  ggplot(aes(x = hashtag, y = count, group = barcode)) +
+  geom_point(shape = 21, size = 0.1) +
+  geom_line(aplha = 0.3, size = 0.1) +
+  facet_wrap(~Best) +
+  theme_basic() +
+  scale_y_log10()
+
+df %>%
+  filter(class == "Negative") %>%
+  select(barcode, Best, all_of(paste0("H", 1:6))) %>%
+  pivot_longer(!c(barcode, Best), names_to = "hashtag", values_to = "count") %>%
+  mutate(hashtag = str_match(hashtag, "\\d")[, 1]) %>%
+  ggplot(aes(x = hashtag, y = count, group = barcode)) +
+  geom_point(shape = 21, size = 0.1) +
+  geom_line(aplha = 0.3, size = 0.1) +
+  facet_wrap(~Best) +
+  theme_basic() +
+  scale_y_log10()
+```
+
+```{r}
+filter_gex <- function(sample_list){
+  good_cells <- sample_list$stats_df %>%
+    filter(!(discard_libsize | discard_features | discard_mito | discard_hb)) %>%
+    rownames
+  
+  # Filter MALAT1, mt and Hb genes
+  genes = rownames(sample_list$gex)
+  good_genes = genes[!(str_detect(genes, "MALAT1") | str_detect(genes, "^MT-") | str_detect(genes, "^HB[^(P)]"))]
+  
+  list(gex = sample_list$gex[good_genes, good_cells],
+       hto = sample_list$hto[, good_cells],
+       ag = sample_list$ag[, good_cells],
+       hash_stats = as.data.frame(sample_list$hash_stats)[good_cells,])
+}
+
+sce_filtered <- lapply(sce_list, filter_gex)
+
+saveRDS(sce_filtered, "tables/sce_list_filtered.Rds")
+```
+
+## Combine data without batch correction
+
+```{r}
+rename_barcodes <- function(x){
+  sc <- sce_filtered[[x]]$gex
+  colnames(sc) <- str_replace(colnames(sc), "1", as.character(x))
+  sc
+}
+
+sce_filtered_gex <- lapply(samples, rename_barcodes)
+
+sce <- cbind(sce_filtered_gex[[1]], sce_filtered_gex[[2]], sce_filtered_gex[[3]], sce_filtered_gex[[4]],
+             sce_filtered_gex[[5]], sce_filtered_gex[[6]], sce_filtered_gex[[7]], sce_filtered_gex[[8]])
+
+metadata <- lapply(samples, function(x) sce_filtered[[x]]$hash_stats %>% mutate(sample = x)) %>%
+  rbindlist
+
+# keep only the genes expressed in at least 1 cells
+expressed_genes = rownames(sce)[rowSums(sign(counts(sce))) > 0]
+sce <- sce[expressed_genes, ]
+```
+
+```{r}
+# remove doublets
+metadata$barcode <- colnames(sce)
+metadata <- metadata %>%
+  filter(!Doublet)
+
+sce <- sce[, metadata$barcode]
+saveRDS(sce, paste0(tables_path, "sce_filtered_combined.Rds"))
+```
+
+Make Seurat object
+
+```{r}
+gex_counts <- counts(sce)
+gex_counts <- as(gex_counts, "dgCMatrix")
+seu <- CreateSeuratObject(counts = gex_counts)
+```
+
+```{r}
+# add antigen barcode read counts
+
+rename_barcodes <- function(x){
+  sc <- counts(sce_filtered[[x]]$ag)
+  colnames(sc) <- str_replace(colnames(sc), "1", as.character(x))
+  sc
+}
+
+sce_filtered_ag <- lapply(samples, rename_barcodes)
+
+ag_counts <- cbind(sce_filtered_ag[[1]], sce_filtered_ag[[2]], sce_filtered_ag[[3]], sce_filtered_ag[[4]],
+                   sce_filtered_ag[[5]], sce_filtered_ag[[6]], sce_filtered_ag[[7]], sce_filtered_ag[[8]])
+
+ag_counts_df <- ag_counts %>%
+  t %>%
+  as.data.frame()
+ag_counts_df$barcode <- rownames(ag_counts_df)
+
+metadata <- metadata %>%
+  merge(ag_counts_df, by = "barcode")
+rownames(metadata) <- metadata$barcode
+
+seu <- AddMetaData(seu, metadata)
+```
+
+```{r}
+seu <- SCTransform(seu) %>%
+  RunPCA(npcs = 30) %>%
+  RunUMAP(reduction = "pca", dims = 1:30) %>%
+  RunTSNE(reduction = "pca", dims = 1:30) %>%
+  FindNeighbors(reduction = "pca", dims = 1:30) %>%
+  FindClusters(resolution = 0.6)
+
+saveRDS(seu, paste0(tables_path, "seu_combined.Rds"))
+```
+
+Some tSNE visualisations
+
+```{r, fig.width=4, fig.height=4}
+Idents(seu) <- "sample"
+p <- DimPlot(seu, reduction = "tsne", label = TRUE,
+             pt.size = 0.4) &
+  coord_equal() &
+  scale_color_tableau(palette = "Classic 20")
+
+pdf(paste0(figures_path, "03_tSNE_by_sample.pdf"), width=7, height=7)
+p
+dev.off()
+```
+
+```{r, fig.width=4, fig.height=4}
+Idents(seu) <- "seurat_clusters"
+p <- DimPlot(seu, reduction = "tsne", label = TRUE,
+             pt.size = 0.4) &
+  coord_equal() &
+  scale_color_tableau(palette = "Classic 20")
+
+pdf(paste0(figures_path, "04_tSNE_by_precluster.pdf"), width=7, height=7)
+p
+dev.off()
+```
+
+## Find non-B cell clusters
+
+```{r, fig.width = 7, fig.height = 6}
+p1 <- VlnPlot(seu, 
+              features = c("IGHV", "MS4A1", "CD79A"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar") &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+p2 <- VlnPlot(seu, 
+              features = c("LYZ", "CD14", "CD68"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar") &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+p3 <- VlnPlot(seu, 
+              features = c("GNLY", "GZMA", "CD3E"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar") &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+p4 <- VlnPlot(seu, 
+              features = c("CD3G", "CD4"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar") &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+pdf(paste0(figures_path, "05_non_B_cell_gene_expression.pdf"), width = 7, height = 6)
+p1 / p2 / p3 / p4
+dev.off()
+```
+
+
+```{r, fig.width = 4, fig.height = 3}
+T_clust = as.character(c(10, 11))
+mono_clust = as.character(c(12, 13, 14, 16))
+
+p <- seu@meta.data %>%
+  mutate(cell_type = case_when(seurat_clusters %in% T_clust ~ "T cell",
+                               seurat_clusters %in% mono_clust ~ "mono/macro",
+                               TRUE ~ "B"),
+         sample = factor(sample, levels = samples)) %>%
+  count(sample, cell_type, name = "count") %>%
+  add_count(sample, wt = count, name = "tot") %>%
+  filter(cell_type != "B") %>%
+  ggplot(aes(x = sample, y = 100*count/tot, fill = cell_type)) +
+  geom_col() +
+  labs(x = "Sample", y = "Frequency, %") +
+  theme_basic() +
+  scale_y_continuous(expand = c(0,0), limits = c(0,20)) +
+  scale_fill_tableau(palette = "Classic 10", name = "")
+
+pdf(paste0(figures_path, "05_non_B_cell_freq.pdf"), width=5, height=3)
+p
+dev.off()
+```
+
+```{r}
+# remove T, NK cells and monocytes
+bcell_seu <- subset(seu, idents = c(T_clust, mono_clust), invert = T)
+```
+
+```{r}
+#sample_name <- fread("../exp_2/metadata/sample_metadata.csv") %>%
+sample_name <- fread("tables/sample_metadata.csv") %>%
+  mutate(donor_id = str_split_fixed(sample_name, "-", 2)[, 1],
+         sample = ifelse(sample_pool == "Test Exp2", 8,
+                         as.integer(str_sub(sample_pool, -1, -1))),
+         hashtag =  paste0("H", (str_split_fixed(hashtag, " ", 2)[, 2]))) %>%
+  select(sample, hashtag, donor_id, timepoint) %>%
+  merge(hash_name)
+
+sample_data <- bcell_seu@meta.data %>%
+  select(barcode, sample, hashtag_num = Best) %>%
+  merge(sample_name, by = c("sample", "hashtag_num"))
+
+rownames(sample_data) <- sample_data$barcode
+bcell_seu <- AddMetaData(bcell_seu, sample_data %>% select(donor_id, timepoint))
+
+saveRDS(bcell_seu, paste0(tables_path, "bcell_seu.Rds"))
+saveRDS(bcell_seu@meta.data, paste0(tables_path, "cell_metadata.Rds"))
+
+```
+
+--- not done ---
+
+## Marker gene expression
+
+```{r, fig.width=6, fig.height=5.8}
+p1 <- VlnPlot(bcell_seu, 
+              features = c("CD27", "CD38", "TFRC"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar", size = 0.2) &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+p2 <- VlnPlot(bcell_seu, 
+              features = c("MKI67", "HIST1H1B", "PCNA"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar", size = 0.2) &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+p3 <- VlnPlot(bcell_seu, 
+              features = c("MZB1", "XBP1", "IGHV"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar", size = 0.2) &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+# p4 <- VlnPlot(bcell_seu, 
+#               features = c("JCHAIN", "IRF4", "PRDM1"), 
+#               pt.size = 0) &
+#   stat_summary(fun = median, geom = "crossbar", size = 0.2) &
+#   theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+#         plot.title = element_text(size = 11),
+#         axis.title.y = element_blank(),
+#         axis.title.x = element_blank()) &
+#   scale_fill_tableau(palette = "Classic 20")
+
+p5 <- VlnPlot(bcell_seu, 
+              #features = c("TCL1A", "IGHM", "IGHD"), 
+              features = c("TCL1A", "CD69", "YBX3"),
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar", size = 0.2) &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+p6 <- VlnPlot(bcell_seu, 
+              features = c("CD86", "DHRS9", "ZEB2"), 
+              pt.size = 0) &
+  stat_summary(fun = median, geom = "crossbar", size = 0.2) &
+  theme(axis.text = element_text(angle = 0, hjust = 0.5, vjust = 0.5, size = 9),
+        plot.title = element_text(size = 11),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank()) &
+  scale_fill_tableau(palette = "Classic 20")
+
+pdf(paste0(figures_path, "marker_gene_expression.pdf"), width = 6, height = 5.8)
+p1 / p2 / p3 / p5 /p6 &
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+dev.off()
+
+p1 / p2 / p3 / p5 /p6
+```
+
+```{r, fig.width=4.9, fig.height=20}
+Idents(bcell_seu) <- "seurat_clusters"
+#markers <- lapply(levels(bcell_seu$seurat_clusters), function(x) FindMarkers(bcell_seu, ident.1 = x, ident.2 = NULL, min.pct = 0.5))
+#saveRDS(markers, "data/cluster_diff_genes.Rds")
+markers <- readRDS("data/cluster_diff_genes.Rds")
+
+top_diff_genes <- unique(unlist(lapply(markers, function(x) rownames(head(x, n = 15)))))
+
+p <- DotPlot(bcell_seu, features = top_diff_genes) +
+  coord_flip() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  scale_color_viridis_c() +
+  guides(color = guide_colorbar(title = 'Scaled\nAverage Expression'))
+
+pdf(paste0(figures_path, "10_diff_genes_by_cluster.pdf"), width = 4.9, height = 20)
+p
+dev.off()
+```
+
+
+
+
+
+```{r, fig.width=5, fig.height=5}
+Idents(bcell_seu) <- "donor"
+p <- DimPlot(bcell_seu, reduction = "tsne",
+             pt.size = 0.4) &
+  coord_equal() &
+  scale_color_tableau() &
+  labs(title = "")
+
+pdf(paste0(figures_path, "tSNE_by_donor.pdf"), width = 7, height = 7)
+p
+dev.off()
+
+p
+```
+
+```{r, fig.width=5, fig.height=5}
+Idents(bcell_seu) <-"timepoint"
+p <- DimPlot(bcell_seu, reduction = "tsne",
+             pt.size = 0.4) &
+  coord_equal() &
+  scale_color_tableau() &
+  labs(title = "")
+
+pdf(paste0(figures_path, "tSNE_by_timepoint.pdf"), width = 7, height = 7)
+p
+dev.off()
+
+p
+```
+
+```{r, fig.width=5, fig.height=5}
+embeds = Embeddings(bcell_seu[["tsne"]]) %>%
+  as.data.frame() %>%
+  mutate(barcode = rownames(Embeddings(bcell_seu[["tsne"]]))) %>%
+  merge(bcell_seu@meta.data)
+
+p1 <- embeds %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, color = Spike)) +
+  geom_point(alpha = 0.7, size = 0.5) +
+  labs(title = "Spike") +
+  theme_basic() +
+  scale_color_viridis_c(trans = "log") +
+  coord_equal()
+
+p2 <- embeds %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, color = RBD)) +
+  geom_point(alpha = 0.7, size = 0.5) +
+  labs(title = "RBD") +
+  theme_basic() +
+  scale_color_viridis_c(trans = "log") +
+  coord_equal()
+
+pdf(paste0(figures_path, "tSNE_by_antigen.pdf"), width=14, height=7)
+p1 + p2
+dev.off()
+```
+
+```{r}
+p1 <- embeds %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, color = nCount_RNA)) +
+  geom_point(alpha = 0.7, size = 0.5) +
+  labs(title = "RNA count") +
+  theme_basic() +
+  scale_color_viridis_c(trans = "log") +
+  coord_equal()
+
+p2 <- embeds %>%
+  ggplot(aes(x = tSNE_1, y = tSNE_2, color = Confident)) +
+  geom_point(alpha = 0.7, size = 0.5) +
+  labs(title = "Confident") +
+  theme_basic() +
+  scale_color_brewer(palette = "Set1") +
+  coord_equal()
+
+pdf(paste0(figures_path, "tSNE_by_QC.pdf"), width=14, height=7)
+p1 + p2
+dev.off()
+```
+
+
